@@ -1,113 +1,122 @@
-import requests
-import pdfplumber
+import camelot
 import pandas as pd
-from io import BytesIO
+import requests
 import urllib3
+import tempfile
+import os
 import re
 
-# Отключаем предупреждения о SSL (если сайт использует самоподписанный сертификат)
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+urllib3.disable_warnings()
 
-def clean_numbers_from_line(line: str):
-    """
-    Извлекает все числа из строки, нормализуя пробелы внутри чисел.
-    Например: "5 000" -> "5000"
-    Возвращает список целых чисел.
-    """
-    # Сначала убираем пробелы между цифрами (5 000 -> 5000, 12 000 -> 12000)
-    line_no_spaces_in_numbers = re.sub(r'(\d)\s+(?=\d)', r'\1', line)
-    # Находим все последовательности цифр
-    numbers = re.findall(r'\d+', line_no_spaces_in_numbers)
-    # Преобразуем в int
-    return [int(num) for num in numbers]
+VALID_TYPES = {'ОР', 'ПК', 'ПП', 'ПО', 'КЦН', 'ЕПЗ'}
 
-def parse_data_line(line: str):
-    """
-    Парсит одну строку таблицы.
-    Возвращает словарь с полями: тип, название, часы (строка), цена (строка).
-    Если строка не содержит данных (нет пар часы+цена) – возвращает None.
-    """
-    line = line.strip()
-    if not line:
-        return None
+def clean_cell(cell):
+    return str(cell).strip() if not pd.isna(cell) else ''
 
-    # Извлекаем все числа из строки
-    numbers = clean_numbers_from_line(line)
-    if not numbers:
-        return None
+def normalize_number(cell):
+    text = clean_cell(cell)
+    if not text:
+        return ''
+    normalized = re.sub(r'(\d)\s+(?=\d)', r'\1', text)
+    numbers = re.findall(r'\d+', normalized)
+    if len(numbers) == 0:
+        return ''
+    if len(numbers) == 1:
+        return numbers[0]
+    if len(numbers) == 2 and len(numbers[0]) <= 2 and len(numbers[1]) >= 3:
+        return numbers[0] + numbers[1]
+    return ' / '.join(numbers)
 
-    # Разбиваем числа на пары (часы, цена)
-    pairs = []
-    for i in range(0, len(numbers) - 1, 2):
-        hours = numbers[i]
-        price = numbers[i + 1]
-        pairs.append((hours, price))
-
-    if not pairs:
-        return None
-
-    # Формируем строки с часами и ценами, объединяя пары через разделитель " / "
-    hours_str = ' / '.join(str(h) for h, _ in pairs)
-    price_str = ' / '.join(str(p) for _, p in pairs)
-
-    # Теперь нужно выделить тип программы и название.
-    # Для этого убираем из строки все найденные числа (они уже извлечены).
-    # Сначала убираем пробелы между цифрами, как и ранее
-    line_clean = re.sub(r'(\d)\s+(?=\d)', r'\1', line)
-    # Удаляем все цифры и лишние пробелы
-    without_numbers = re.sub(r'\d+', '', line_clean)
-    without_numbers = re.sub(r'\s+', ' ', without_numbers).strip()
-
-    # В начале строки может быть указание типа: например "ОР*", "ПК/", "ПП*"
-    # Пытаемся найти тип как последовательность из 2-4 букв (русских или латинских) и, возможно, символов * /
-    type_match = re.match(r'^([A-Za-zА-Яа-я]{2,4}[\*/]?)\s+', without_numbers)
-    prog_type = ''
-    name_part = without_numbers
-    if type_match:
-        prog_type = type_match.group(1)
-        name_part = without_numbers[type_match.end():].strip()
-
-    return {
-        'Тип программы': prog_type,
-        'Наименование программы': name_part,
-        'Кол-во часов': hours_str,
-        'Стоимость, руб.': price_str
-    }
+def is_valid_type(cell):
+    val = clean_cell(cell).upper().rstrip('*')
+    return val if val in VALID_TYPES else ''
 
 def main():
     url = "https://anodpo.ru/price.pdf"
-    print(f"Загрузка PDF: {url}")
-    response = requests.get(url, verify=False, timeout=30)
-    response.raise_for_status()
-    print("PDF успешно загружен, начинаю парсинг...")
+    print("Загружаем PDF...")
+    resp = requests.get(url, verify=False)
+    resp.raise_for_status()
 
-    all_data = []
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
+        tmp.write(resp.content)
+        tmp_path = tmp.name
 
-    with pdfplumber.open(BytesIO(response.content)) as pdf:
-        # Данные начинаются с 4-й страницы (индекс 3)
-        for page_num in range(3, len(pdf.pages)):
-            page = pdf.pages[page_num]
-            text = page.extract_text()
-            if not text:
-                continue
-            lines = text.split('\n')
-            for line in lines:
-                parsed = parse_data_line(line)
-                if parsed:
-                    parsed['Страница'] = page_num + 1
-                    all_data.append(parsed)
+    try:
+        print("Извлекаем таблицы (flavor='lattice')...")
+        tables = camelot.read_pdf(tmp_path, pages='4-end', flavor='lattice')
+        print(f"Найдено таблиц: {len(tables)}")
 
-    if not all_data:
-        print("Не удалось извлечь данные. Проверьте структуру PDF.")
-        return
+        all_rows = []
+        for table in tables:
+            df = table.df
+            n_cols = df.shape[1]
+            if n_cols > 5:
+                df = df.iloc[:, :5]
+            else:
+                for _ in range(5 - n_cols):
+                    df[f'col{len(df.columns)}'] = ''
+            df.columns = ['Вид', 'Наименование', 'Часы', 'Цена', 'Примечание']
+            page_num = table.page
 
-    # Создаём DataFrame
-    df = pd.DataFrame(all_data)
+            i = 0
+            while i < len(df):
+                row = df.iloc[i]
+                prog_type = clean_cell(row['Вид'])
+                valid_type = is_valid_type(prog_type)
+                if valid_type:
+                    name = clean_cell(row['Наименование'])
+                    hours = clean_cell(row['Часы'])
+                    price = clean_cell(row['Цена'])
+                    note = clean_cell(row['Примечание'])
+                    j = i + 1
+                    while j < len(df) and not is_valid_type(clean_cell(df.iloc[j]['Вид'])):
+                        next_name = clean_cell(df.iloc[j]['Наименование'])
+                        if next_name:
+                            name += ' ' + next_name
+                        if not hours and clean_cell(df.iloc[j]['Часы']):
+                            hours = clean_cell(df.iloc[j]['Часы'])
+                        if not price and clean_cell(df.iloc[j]['Цена']):
+                            price = clean_cell(df.iloc[j]['Цена'])
+                        if not note and clean_cell(df.iloc[j]['Примечание']):
+                            note = clean_cell(df.iloc[j]['Примечание'])
+                        j += 1
+                    hours = normalize_number(hours)
+                    price = normalize_number(price)
+                    name = re.sub(r'\s+', ' ', name).strip()
+                    note = re.sub(r'\s+', ' ', note).strip()
+                    all_rows.append({
+                        'Вид программы': valid_type,
+                        'Наименование программы': name,
+                        'Кол-во часов': hours,
+                        'Стоимость, руб.': price,
+                        'Примечание': note,
+                        'Страница': page_num
+                    })
+                    i = j
+                else:
+                    i += 1
 
-    # Сохраняем в Excel
-    output_file = "anodpo_prices.xlsx"
-    df.to_excel(output_file, index=False, engine='openpyxl')
-    print(f"✅ Готово! Сохранено {len(df)} записей в файл '{output_file}'")
+        if not all_rows:
+            print("Не найдено записей с допустимыми видами.")
+            return
+
+        df_result = pd.DataFrame(all_rows)
+        df_result = df_result.drop_duplicates()
+        output = "anodpo_final_with_notes.xlsx"
+        df_result.to_excel(output, index=False)
+        print(f"✅ Сохранено {len(df_result)} записей в {output}")
+        print("\nПример первых 10 записей:")
+        print(df_result.head(10).to_string())
+
+    except Exception as e:
+        print(f"Ошибка: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except PermissionError:
+            pass
 
 if __name__ == "__main__":
     main()
