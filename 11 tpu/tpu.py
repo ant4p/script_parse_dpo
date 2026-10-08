@@ -17,8 +17,13 @@ OUTPUT_FILENAME = "tpu_programs.xlsx"
 DELAY_BETWEEN_TABS = 2
 WAIT_TIMEOUT = 10
 
+# Настройки прокрутки
+SCROLL_PAUSE_TIME = 1
+MAX_SCROLL_ATTEMPTS = 30
+
 # Для сохранения при прерывании
 all_programs = []
+
 
 def signal_handler(sig, frame):
     print("\n⚠️ Прерывание. Сохраняем собранные данные...")
@@ -26,9 +31,11 @@ def signal_handler(sig, frame):
         save_to_excel(all_programs, OUTPUT_FILENAME)
     sys.exit(0)
 
+
 def save_to_excel(data: List[Dict], filename: str):
     if not data:
         return
+
     if os.path.exists(filename):
         try:
             existing_df = pd.read_excel(filename)
@@ -41,8 +48,13 @@ def save_to_excel(data: List[Dict], filename: str):
 
     combined = existing_data + data
     df = pd.DataFrame(combined)
-    # Дедупликация по ключевым полям
-    df = df.drop_duplicates(subset=['Раздел', 'Название программы', 'Часы', 'Стоимость'], keep='first')
+
+    # Дедупликация
+    df = df.drop_duplicates(
+        subset=['Раздел', 'Название программы', 'Часы', 'Стоимость'],
+        keep='first'
+    )
+
     cols_order = [
         'Раздел',
         'Название программы',
@@ -56,32 +68,34 @@ def save_to_excel(data: List[Dict], filename: str):
     df.to_excel(filename, index=False)
     print(f"💾 Сохранено {len(df)} записей в {filename}")
 
+
 def parse_card(card, section_name: str) -> Dict:
     """Извлекает данные из одной карточки .direction"""
-    # Часы (первый .short-title внутри .direction__training)
     hours_elem = card.find('div', class_='direction__training')
+
+    # Часы
     hours = ""
     if hours_elem:
         short_title = hours_elem.find('span', class_='short-title')
         if short_title:
             hours = short_title.get_text(strip=True)
 
-    # Стоимость (.title внутри .direction__training)
+    # Стоимость
     price = ""
     if hours_elem:
         title_elem = hours_elem.find('span', class_='title')
         if title_elem:
             price = title_elem.get_text(strip=True)
 
-    # Комментарий (.short-title внутри .direction__educational-program)
-    comment = ""
+    # Название программы + комментарий
     prog_elem = card.find('div', class_='direction__educational-program')
+
+    comment = ""
     if prog_elem:
         comment_elem = prog_elem.find('span', class_='short-title')
         if comment_elem:
             comment = comment_elem.get_text(strip=True)
 
-    # Название программы (h4 a)
     program_name = ""
     if prog_elem:
         name_elem = prog_elem.find('h4')
@@ -90,7 +104,7 @@ def parse_card(card, section_name: str) -> Dict:
             if a_tag:
                 program_name = a_tag.get_text(strip=True)
 
-    # Ссылка на программу (href из .more)
+    # Ссылка
     link = ""
     more_link = card.find('a', class_='more')
     if more_link and more_link.has_attr('href'):
@@ -102,78 +116,102 @@ def parse_card(card, section_name: str) -> Dict:
         'Ссылка': link,
         'Часы': hours,
         'Стоимость': price,
-        'Комментарий': comment
+        'Комментарий': comment,
     }
+
+
+def scroll_to_bottom(driver, pause=SCROLL_PAUSE_TIME, max_attempts=MAX_SCROLL_ATTEMPTS):
+    """Прокрутка страницы вниз до стабилизации высоты."""
+    last_height = driver.execute_script("return document.body.scrollHeight")
+
+    for _ in range(max_attempts):
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(pause)
+        new_height = driver.execute_script("return document.body.scrollHeight")
+
+        if new_height == last_height:
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(pause)
+            new_height = driver.execute_script("return document.body.scrollHeight")
+            if new_height == last_height:
+                break
+
+        last_height = new_height
+
+    print(f"   ⬇️ Прокрутка завершена, высота страницы: {last_height}")
+
 
 def scrape_with_selenium():
     global all_programs
-    # Используем Firefox (как в примере) или Chrome – поменяйте при необходимости
+
     driver = webdriver.Firefox()
     driver.get(URL)
     time.sleep(3)
 
-    # Закрываем возможное всплывающее окно (если есть)
+    # Закрываем возможное модальное окно
     try:
         close_btn = WebDriverWait(driver, 5).until(
             EC.element_to_be_clickable((By.CSS_SELECTOR, "button.modal__close"))
         )
         close_btn.click()
         time.sleep(1)
-    except:
+    except Exception:
         pass
 
-    # Получаем все кнопки вкладок
     tab_buttons = driver.find_elements(By.CSS_SELECTOR, "button.tabs-navigation__btn")
     print(f"🔍 Найдено вкладок: {len(tab_buttons)}")
 
-    for idx, btn in enumerate(tab_buttons, 1):
+    # Один раз запрашиваем все блоки контента, чтобы проверить их количество
+    tab_content_containers = driver.find_elements(By.CSS_SELECTOR, "div.js-tab")
+    print(f"🔍 Найдено блоков контента (div.js-tab): {len(tab_content_containers)}")
+
+    if len(tab_content_containers) < len(tab_buttons):
+        print("⚠️ Блоков контента меньше, чем вкладок — проверьте селектор.")
+
+    for idx, btn in enumerate(tab_buttons):
         section_name = btn.text.strip()
         if not section_name:
             continue
 
-        print(f"\n[{idx}/{len(tab_buttons)}] Обработка: {section_name}")
+        print(f"\n[{idx + 1}/{len(tab_buttons)}] Обработка: {section_name}")
 
+        # Клик по вкладке
         try:
-            # Клик по вкладке через JavaScript, чтобы избежать перекрытий
             driver.execute_script("arguments[0].click();", btn)
-            print(f"   Клик по вкладке {idx}")
         except Exception as e:
             print(f"   ❌ Ошибка клика: {e}")
             continue
 
-        # Ждём появления активного контента с классом .js-tab._enter-to
-        try:
-            WebDriverWait(driver, WAIT_TIMEOUT).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, ".js-tab._enter-to"))
-            )
-            print(f"   ✅ Контент загрузился")
-        except:
-            print(f"   ⚠️ Контент не появился за {WAIT_TIMEOUT} сек")
-            time.sleep(DELAY_BETWEEN_TABS)
+        # Даём анимации завершиться
+        time.sleep(DELAY_BETWEEN_TABS)
+
+        # Прокрутка страницы до конца
+        scroll_to_bottom(driver)
+        time.sleep(SCROLL_PAUSE_TIME)
+
+        # Заново получаем контейнеры — они могли пересоздаться
+        tab_content_containers = driver.find_elements(By.CSS_SELECTOR, "div.js-tab")
+        if idx >= len(tab_content_containers):
+            print(f"   ⚠️ Нет блока контента для индекса {idx}")
             continue
 
-        time.sleep(1)
+        # Берём контент именно этой вкладки по индексу
+        content_el = tab_content_containers[idx]
+        html = content_el.get_attribute('outerHTML')
+        soup = BeautifulSoup(html, 'html.parser')
 
-        # Парсим карточки только для текущей вкладки (парсим каждую, но можно собрать все сразу)
-        soup = BeautifulSoup(driver.page_source, 'html.parser')
-        # Ищем активный блок контента (может быть несколько, но активный имеет класс _enter-to)
-        active_content = soup.find('div', class_='js-tab', attrs={'class': lambda x: x and '_enter-to' in x.split()})
-        if not active_content:
-            print(f"   ⚠️ Не найден активный блок для {section_name}")
-            continue
-
-        cards = active_content.find_all('div', class_='direction')
+        cards = soup.find_all('div', class_='direction')
         print(f"   📄 Найдено программ: {len(cards)}")
 
         for card in cards:
-            program_data = parse_card(card, section_name)
-            # Проверка, что данные не пустые (хотя бы название)
-            if program_data['Название программы']:
-                all_programs.append(program_data)
+            data = parse_card(card, section_name)
+            if data['Название программы']:
+                all_programs.append(data)
 
         time.sleep(DELAY_BETWEEN_TABS)
 
     driver.quit()
+
 
 def main():
     signal.signal(signal.SIGINT, signal_handler)
@@ -184,6 +222,7 @@ def main():
         print(f"\n✅ Всего собрано записей: {len(all_programs)}")
     else:
         print("❌ Данные не собраны.")
+
 
 if __name__ == "__main__":
     main()
