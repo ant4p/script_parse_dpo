@@ -3,7 +3,7 @@ from bs4 import BeautifulSoup
 import pandas as pd
 from urllib.parse import urljoin
 import urllib3
-import warnings
+
 
 # Отключаем только SSL-предупреждения (для самоподписанного сертификата)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
